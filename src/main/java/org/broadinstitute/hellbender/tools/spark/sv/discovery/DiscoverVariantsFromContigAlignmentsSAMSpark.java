@@ -7,8 +7,6 @@ import htsjdk.samtools.SAMRecord;
 import htsjdk.samtools.SAMSequenceDictionary;
 import htsjdk.samtools.util.SequenceUtil;
 import htsjdk.variant.variantcontext.VariantContext;
-import htsjdk.variant.variantcontext.VariantContextBuilder;
-import htsjdk.variant.vcf.VCFHeader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.spark.api.java.JavaPairRDD;
@@ -22,7 +20,6 @@ import org.broadinstitute.barclay.argparser.CommandLineProgramProperties;
 import org.broadinstitute.barclay.help.DocumentedFeature;
 import org.broadinstitute.hellbender.cmdline.StandardArgumentDefinitions;
 import org.broadinstitute.hellbender.cmdline.programgroups.StructuralVariantDiscoveryProgramGroup;
-import org.broadinstitute.hellbender.engine.FeatureDataSource;
 import org.broadinstitute.hellbender.engine.datasources.ReferenceMultiSource;
 import org.broadinstitute.hellbender.engine.filters.ReadFilter;
 import org.broadinstitute.hellbender.engine.filters.ReadFilterLibrary;
@@ -38,7 +35,6 @@ import scala.Tuple2;
 
 import java.io.IOException;
 import java.io.Serializable;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -134,43 +130,16 @@ public final class DiscoverVariantsFromContigAlignmentsSAMSpark extends GATKSpar
     @Override
     protected void runTool(final JavaSparkContext ctx) {
 
-        final SAMFileHeader headerForReads = getHeaderForReads();
+        final SvDiscoveryDataBundle svDiscoveryDataBundle =
+                new SvDiscoveryDataBundle(ctx, discoverStageArgs, vcfOutputFileName, null, null,
+                        null,
+                        getReads(), getHeaderForReads(), getReference(), localLogger);
 
-        final String sampleId = SVUtils.getSampleId(headerForReads);
+        final JavaRDD<AlignedContig> parsedContigAlignments =
+                new SAMFormattedContigAlignmentParser(svDiscoveryDataBundle.reads, svDiscoveryDataBundle.headerBroadcast.getValue(), true)
+                        .getAlignedContigs();
 
-        final Broadcast<SVIntervalTree<VariantContext>> broadcastCNVCalls = broadcastCNVCalls(ctx, headerForReads, sampleId, discoverStageArgs);
-
-        final JavaRDD<AlignedContig> parsedContigAlignments
-                = new SAMFormattedContigAlignmentParser(getReads(), headerForReads, true)
-                .getAlignedContigs();
-
-        discoverVariantsAndWriteVCF(parsedContigAlignments,
-                null,
-                discoverStageArgs,
-                ctx.broadcast(getReference()),
-                ctx.broadcast(headerForReads.getSequenceDictionary()),
-                vcfOutputFileName,
-                localLogger,
-                broadcastCNVCalls,
-                sampleId
-        );
-    }
-
-    public static Broadcast<SVIntervalTree<VariantContext>> broadcastCNVCalls(final JavaSparkContext ctx, final SAMFileHeader header, final String sampleId, final DiscoverVariantsFromContigsAlignmentsSparkArgumentCollection discoverStageArgs) {
-        final SVIntervalTree<VariantContext> cnvCalls;
-        if (discoverStageArgs.cnvCallsFile != null) {
-            cnvCalls = loadCNVCalls(discoverStageArgs.cnvCallsFile, header, sampleId);
-        } else {
-            cnvCalls = null;
-        }
-
-        final Broadcast<SVIntervalTree<VariantContext>> broadcastCNVCalls;
-        if (cnvCalls != null) {
-            broadcastCNVCalls = ctx.broadcast(cnvCalls);
-        } else {
-            broadcastCNVCalls = null;
-        }
-        return broadcastCNVCalls;
+        discoverVariantsAndWriteVCF(svDiscoveryDataBundle, parsedContigAlignments);
     }
 
     public static final class SAMFormattedContigAlignmentParser extends AlignedContigGenerator implements Serializable {
@@ -247,115 +216,73 @@ public final class DiscoverVariantsFromContigAlignmentsSAMSpark extends GATKSpar
      * Makes sense out of the alignment records of the locally assembled contigs,
      * turn into annotated {@link VariantContext}'s, and writes them to VCF.
      */
-    public static void discoverVariantsAndWriteVCF(final JavaRDD<AlignedContig> alignedContigs,
-                                                   final List<SVInterval> assembledIntervals,
-                                                   final DiscoverVariantsFromContigsAlignmentsSparkArgumentCollection parameters,
-                                                   final Broadcast<ReferenceMultiSource> broadcastReference,
-                                                   final Broadcast<SAMSequenceDictionary> broadcastSamSequenceDictionary,
-                                                   final String vcfOutputFileName,
-                                                   final Logger localLogger,
-                                                   final Broadcast<SVIntervalTree<VariantContext>> broadcastCNVCalls,
-                                                   final String sampleId) {
+    public static void discoverVariantsAndWriteVCF(final SvDiscoveryDataBundle svDiscoveryDataBundle,
+                                                   final JavaRDD<AlignedContig> alignedContigs) {
 
-        discoverVariantsAndWriteVCF(alignedContigs, assembledIntervals, parameters, broadcastReference,
-                broadcastSamSequenceDictionary, vcfOutputFileName, localLogger, null, null,
-                broadcastCNVCalls, sampleId);
+
+        final JavaPairRDD<NovelAdjacencyReferenceLocations, Iterable<ChimericAlignment>> narlsAndSources =
+                detectNarls(svDiscoveryDataBundle, alignedContigs);
+
+        List<VariantContext> annotatedVariants =
+                inferTypeAndAnnotateByAlignmentSignatures(narlsAndSources, svDiscoveryDataBundle.cnvCallsBroadcast,
+                        svDiscoveryDataBundle.sampleId, svDiscoveryDataBundle.referenceBroadcast,
+                        svDiscoveryDataBundle.referenceSequenceDictionaryBroadcast);
+
+        narlsAndSources.unpersist();
+
+        annotatedVariants = detectImpreciseVariantsAndAddReadAnnotations(svDiscoveryDataBundle, annotatedVariants);
+
+        SVVCFWriter.writeVCF(annotatedVariants,
+                svDiscoveryDataBundle.outputPath,
+                svDiscoveryDataBundle.referenceSequenceDictionaryBroadcast.getValue(),
+                svDiscoveryDataBundle.toolLogger);
     }
 
-    public static void discoverVariantsAndWriteVCF(final JavaRDD<AlignedContig> alignedContigs,
-                                                   final List<SVInterval> assembledIntervals,
-                                                   final DiscoverVariantsFromContigsAlignmentsSparkArgumentCollection parameters,
-                                                   final Broadcast<ReferenceMultiSource> broadcastReference,
-                                                   final Broadcast<SAMSequenceDictionary> broadcastSequenceDictionary,
-                                                   final String vcfOutputFileName,
-                                                   final Logger localLogger,
-                                                   final PairedStrandedIntervalTree<EvidenceTargetLink> evidenceTargetLinks,
-                                                   final ReadMetadata metadata,
-                                                   final Broadcast<SVIntervalTree<VariantContext>> broadcastCNVCalls,
-                                                   final String sampleId) {
+    //==================================================================================================================
 
-        Utils.validate(! (evidenceTargetLinks != null && metadata == null),
-                "Must supply read metadata when incorporating evidence target links");
+    private static JavaPairRDD<NovelAdjacencyReferenceLocations, Iterable<ChimericAlignment>> detectNarls(final SvDiscoveryDataBundle svDiscoveryDataBundle,
+                                                                                                          final JavaRDD<AlignedContig> alignedContigs) {
+        final List<SVInterval> assembledIntervals = svDiscoveryDataBundle.assembledIntervals;
+        final Broadcast<SAMSequenceDictionary> referenceSequenceDictionaryBroadcast = svDiscoveryDataBundle.referenceSequenceDictionaryBroadcast;
+        final DiscoverVariantsFromContigsAlignmentsSparkArgumentCollection parameters = svDiscoveryDataBundle.discoverStageArgs;
+        final Logger toolLogger = svDiscoveryDataBundle.toolLogger;
 
         final JavaPairRDD<NovelAdjacencyReferenceLocations, Iterable<ChimericAlignment>> narlsAndSources =
                 alignedContigs.filter(alignedContig -> alignedContig.alignmentIntervals.size()>1)                                     // filter out any contigs that has less than two alignment records
                         .mapToPair(alignedContig -> new Tuple2<>(alignedContig.contigSequence,                                        // filter a contig's alignment and massage into ordered collection of chimeric alignments
-                                ChimericAlignment.parseOneContig(alignedContig, broadcastSequenceDictionary.getValue(),
+                                ChimericAlignment.parseOneContig(alignedContig, referenceSequenceDictionaryBroadcast.getValue(),
                                         true, DEFAULT_MIN_ALIGNMENT_LENGTH, CHIMERIC_ALIGNMENTS_HIGHMQ_THRESHOLD, true)))
-                        .flatMapToPair(pair -> discoverNovelAdjacencyFromChimericAlignments(pair, broadcastSequenceDictionary.getValue()))       // a filter-passing contig's alignments may or may not produce novel adjacency
+                        .flatMapToPair(pair -> discoverNovelAdjacencyFromChimericAlignments(pair, referenceSequenceDictionaryBroadcast.getValue()))       // a filter-passing contig's alignments may or may not produce novel adjacency
                         .groupByKey();                                                                                                // group the same novel adjacency produced by different contigs together
 
         narlsAndSources.cache();
 
         if ( parameters.truthVCF != null ) {
-            final SAMSequenceDictionary sequenceDictionary = broadcastSequenceDictionary.getValue();
+            final SAMSequenceDictionary sequenceDictionary = referenceSequenceDictionaryBroadcast.getValue();
             final SVIntervalTree<String> trueBreakpoints =
                     SVVCFReader.readBreakpointsFromTruthVCF(parameters.truthVCF, sequenceDictionary, parameters.truthIntervalPadding);
 
             if ( assembledIntervals != null ) {
-                evaluateIntervalsAgainstTruth(assembledIntervals, trueBreakpoints, localLogger);
+                evaluateIntervalsAgainstTruth(assembledIntervals, trueBreakpoints, toolLogger);
             }
 
             final SVIntervalTree<String> narlyBreakpoints =
                     readBreakpointsFromNarls(narlsAndSources.map(Tuple2::_1).collect(), sequenceDictionary, parameters.truthIntervalPadding);
 
-            evaluateNarlsAgainstTruth(narlyBreakpoints, trueBreakpoints, localLogger);
+            evaluateNarlsAgainstTruth(narlyBreakpoints, trueBreakpoints, toolLogger);
         }
 
-        List<VariantContext> annotatedVariants =
-                narlsAndSources
-                        .mapToPair(noveltyAndEvidence -> inferType(noveltyAndEvidence._1, noveltyAndEvidence._2))                     // type inference based on novel adjacency and evidence alignments
-                        .map(noveltyTypeAndEvidence ->
-                                annotateVariant(                                                                                      // annotate the novel adjacency and inferred type
-                                        noveltyTypeAndEvidence._1,
-                                        noveltyTypeAndEvidence._2._1,
-                                        null,
-                                        noveltyTypeAndEvidence._2._2,
-                                        broadcastReference,
-                                        broadcastSequenceDictionary,
-                                        broadcastCNVCalls,
-                                        sampleId))
-                        .collect();
-
-        narlsAndSources.unpersist();
-
-        if (evidenceTargetLinks != null) {
-            annotatedVariants = processEvidenceTargetLinks(
-                    annotatedVariants,
-                    evidenceTargetLinks,
-                    metadata,
-                    broadcastReference.getValue(),
-                    parameters,
-                    localLogger);
-        }
-
-        SVVCFWriter.writeVCF(annotatedVariants, vcfOutputFileName, broadcastSequenceDictionary.getValue(), localLogger);
+        return narlsAndSources;
     }
 
-
+    // TODO: 7/6/17 interface to be changed in the new implementation, where one contig produces a set of NARL's.
     /**
-     * Loads an external cnv call list and returns the results in an SVIntervalTree. NB: the contig indices in the SVIntervalTree
-     * are based on the sequence indices in the SAM header, _NOT_ the ReadMetadata (which we might not have access to at this
-     * time).
+     * Given contig alignments, emit novel adjacency not present on the reference to which the locally-assembled contigs were aligned.
      */
-    public static SVIntervalTree<VariantContext> loadCNVCalls(final String cnvCallsFile, final SAMFileHeader headerForReads, final String sampleId) {
-        Utils.validate(cnvCallsFile != null, "Can't load null CNV calls file");
-        try ( final FeatureDataSource<VariantContext> dataSource = new FeatureDataSource<>(cnvCallsFile, null, 0, null) ) {
-            final VCFHeader cnvCallHeader = (VCFHeader) dataSource.getHeader();
-            final ArrayList<String> sampleNamesInOrder = cnvCallHeader.getSampleNamesInOrder();
-            Utils.validate(sampleNamesInOrder.size() == 1, "CNV call VCF should be single sample");
-            Utils.validate(sampleNamesInOrder.contains(sampleId), ("CNV call VCF does not contain calls for sample " + sampleId));
-            Utils.validate(cnvCallHeader.getSequenceDictionary() != null,
-                    "CNV calls file does not have a valid sequence dictionary");
-            Utils.validate(cnvCallHeader.getSequenceDictionary().isSameDictionary(headerForReads.getSequenceDictionary()),
-                "CNV calls file does not have the same sequence dictionary as the read evidence");
-            final SVIntervalTree<VariantContext> cnvCallTree = new SVIntervalTree<>();
-            Utils.stream(dataSource.iterator())
-                    .map(vc -> new VariantContextBuilder(vc).genotypes(vc.getGenotype(sampleId)).make()) // forces a decode of the genotype for serialization purposes
-                    .map(vc -> new Tuple2<>(new SVInterval(headerForReads.getSequenceIndex(vc.getContig()), vc.getStart(), vc.getEnd()),vc))
-                    .forEach(pv -> cnvCallTree.put(pv._1(), pv._2()));
-            return cnvCallTree;
-        }
+    public static Iterator<Tuple2<NovelAdjacencyReferenceLocations, ChimericAlignment>>
+    discoverNovelAdjacencyFromChimericAlignments(final Tuple2<byte[], List<ChimericAlignment>> tigSeqAndChimeras, final SAMSequenceDictionary referenceDictionary) {
+        return Utils.stream(tigSeqAndChimeras._2)
+                .map(ca -> new Tuple2<>(new NovelAdjacencyReferenceLocations(ca, tigSeqAndChimeras._1, referenceDictionary), ca)).iterator();
     }
 
     public static SVIntervalTree<String> readBreakpointsFromNarls( final List<NovelAdjacencyReferenceLocations> narls,
@@ -402,6 +329,78 @@ public final class DiscoverVariantsFromContigAlignmentsSAMSpark extends GATKSpar
         localLogger.info("Interval false negative rate = " + falseNeg + " (" + Math.round(falseNeg*nTrue) + "/" + nTrue + ")");
     }
 
+    //==================================================================================================================
+
+    private static List<VariantContext> inferTypeAndAnnotateByAlignmentSignatures(final JavaPairRDD<NovelAdjacencyReferenceLocations, Iterable<ChimericAlignment>> narlsAndSources,
+                                                                                  final Broadcast<SVIntervalTree<VariantContext>> cnvCallsBroadcast,
+                                                                                  final String sampleId,
+                                                                                  final Broadcast<ReferenceMultiSource> referenceBroadcast,
+                                                                                  final Broadcast<SAMSequenceDictionary> referenceSequenceDictionaryBroadcast) {
+
+        return narlsAndSources
+                .mapToPair(noveltyAndEvidence -> inferType(noveltyAndEvidence._1, noveltyAndEvidence._2))                     // type inference based on novel adjacency and evidence alignments
+                .map(noveltyTypeAndEvidence ->
+                        annotateVariant(                                                                                      // annotate the novel adjacency and inferred type
+                                noveltyTypeAndEvidence._1,
+                                noveltyTypeAndEvidence._2._1,
+                                null,
+                                noveltyTypeAndEvidence._2._2,
+                                referenceBroadcast,
+                                referenceSequenceDictionaryBroadcast,
+                                cnvCallsBroadcast,
+                                sampleId))
+                .collect();
+    }
+
+    // TODO: 7/6/17 interface to be changed in the new implementation, where a set of NARL's associated with a single contig is considered together.
+    /**
+     * Given input novel adjacency and evidence chimeric alignments, infer type of variant.
+     */
+    public static Tuple2<NovelAdjacencyReferenceLocations, Tuple2<SvType, Iterable<ChimericAlignment>>> inferType(
+            final NovelAdjacencyReferenceLocations novelAdjacency,
+            final Iterable<ChimericAlignment> chimericAlignments) {
+        return new Tuple2<>(novelAdjacency,
+                new Tuple2<>(SvTypeInference.inferFromNovelAdjacency(novelAdjacency), chimericAlignments));
+    }
+
+
+    /**
+     * Produces annotated variant as described in {@link GATKSVVCFHeaderLines}, given input arguments.
+     */
+    public static VariantContext annotateVariant(final NovelAdjacencyReferenceLocations novelAdjacency,
+                                                 final SvType inferredType,
+                                                 final byte[] altHaplotypeSeq,
+                                                 final Iterable<ChimericAlignment> chimericAlignments,
+                                                 final Broadcast<ReferenceMultiSource> broadcastReference,
+                                                 final Broadcast<SAMSequenceDictionary> broadcastSequenceDictionary,
+                                                 final Broadcast<SVIntervalTree<VariantContext>> broadcastCNVCalls,
+                                                 final String sampleId)
+            throws IOException {
+        return AnnotatedVariantProducer
+                .produceAnnotatedVcFromInferredTypeAndRefLocations(novelAdjacency.leftJustifiedLeftRefLoc,
+                        novelAdjacency.leftJustifiedRightRefLoc.getStart(), novelAdjacency.complication,
+                        inferredType, altHaplotypeSeq, chimericAlignments,
+                        broadcastReference, broadcastSequenceDictionary, broadcastCNVCalls, sampleId);
+    }
+
+    //==================================================================================================================
+
+    private static List<VariantContext> detectImpreciseVariantsAndAddReadAnnotations(final SvDiscoveryDataBundle svDiscoveryDataBundle,
+                                                                                     List<VariantContext> annotatedVariants) {
+        final PairedStrandedIntervalTree<EvidenceTargetLink> evidenceTargetLinks = svDiscoveryDataBundle.evidenceTargetLinks;
+
+        if (evidenceTargetLinks != null) {
+            annotatedVariants = processEvidenceTargetLinks(
+                    annotatedVariants,
+                    evidenceTargetLinks,
+                    svDiscoveryDataBundle.metadata,
+                    svDiscoveryDataBundle.referenceBroadcast.getValue(),
+                    svDiscoveryDataBundle.discoverStageArgs,
+                    svDiscoveryDataBundle.toolLogger);
+        }
+        return annotatedVariants;
+    }
+
     /**
      * Uses the input EvidenceTargetLinks to either annotate the variants called from assembly discovery with split
      * read and read pair evidence, or to call new imprecise variants if the number of pieces of evidence exceeds
@@ -445,45 +444,4 @@ public final class DiscoverVariantsFromContigAlignmentsSAMSpark extends GATKSpar
         return AnnotatedVariantProducer
                 .produceAnnotatedVcFromEvidenceTargetLink(e, svType, metadata, reference);
     }
-
-    // TODO: 7/6/17 interface to be changed in the new implementation, where one contig produces a set of NARL's.
-    /**
-     * Given contig alignments, emit novel adjacency not present on the reference to which the locally-assembled contigs were aligned.
-     */
-    public static Iterator<Tuple2<NovelAdjacencyReferenceLocations, ChimericAlignment>>
-    discoverNovelAdjacencyFromChimericAlignments(final Tuple2<byte[], List<ChimericAlignment>> tigSeqAndChimeras, final SAMSequenceDictionary referenceDictionary) {
-        return Utils.stream(tigSeqAndChimeras._2)
-                .map(ca -> new Tuple2<>(new NovelAdjacencyReferenceLocations(ca, tigSeqAndChimeras._1, referenceDictionary), ca)).iterator();
-    }
-
-    // TODO: 7/6/17 interface to be changed in the new implementation, where a set of NARL's associated with a single contig is considered together.
-    /**
-     * Given input novel adjacency and evidence chimeric alignments, infer type of variant.
-     */
-    public static Tuple2<NovelAdjacencyReferenceLocations, Tuple2<SvType, Iterable<ChimericAlignment>>> inferType(
-            final NovelAdjacencyReferenceLocations novelAdjacency,
-            final Iterable<ChimericAlignment> chimericAlignments) {
-        return new Tuple2<>(novelAdjacency,
-                new Tuple2<>(SvTypeInference.inferFromNovelAdjacency(novelAdjacency), chimericAlignments));
-    }
-
-    /**
-     * Produces annotated variant as described in {@link GATKSVVCFHeaderLines}, given input arguments.
-     */
-    public static VariantContext annotateVariant(final NovelAdjacencyReferenceLocations novelAdjacency,
-                                                 final SvType inferredType,
-                                                 final byte[] altHaplotypeSeq,
-                                                 final Iterable<ChimericAlignment> chimericAlignments,
-                                                 final Broadcast<ReferenceMultiSource> broadcastReference,
-                                                 final Broadcast<SAMSequenceDictionary> broadcastSequenceDictionary,
-                                                 final Broadcast<SVIntervalTree<VariantContext>> broadcastCNVCalls,
-                                                 final String sampleId)
-            throws IOException {
-        return AnnotatedVariantProducer
-                .produceAnnotatedVcFromInferredTypeAndRefLocations(novelAdjacency.leftJustifiedLeftRefLoc,
-                        novelAdjacency.leftJustifiedRightRefLoc.getStart(), novelAdjacency.complication,
-                        inferredType, altHaplotypeSeq, chimericAlignments,
-                        broadcastReference, broadcastSequenceDictionary, broadcastCNVCalls, sampleId);
-    }
-
 }
