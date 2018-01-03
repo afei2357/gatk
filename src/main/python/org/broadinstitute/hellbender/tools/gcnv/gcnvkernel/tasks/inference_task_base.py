@@ -587,7 +587,7 @@ class HybridInferenceParameters:
         assert self.max_advi_iter_subsequent_epochs > 0
         assert self.min_training_epochs > 0
         assert self.max_training_epochs > 0
-        assert self.max_training_epochs > self.min_training_epochs
+        assert self.max_training_epochs >= self.min_training_epochs
         assert self.num_thermal_epochs <= self.max_training_epochs
         assert self.initial_temperature >= 1.0
         assert self.disable_annealing or self.num_thermal_epochs > 0
