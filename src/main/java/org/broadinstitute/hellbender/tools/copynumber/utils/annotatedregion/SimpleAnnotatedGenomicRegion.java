@@ -118,7 +118,7 @@ final public class SimpleAnnotatedGenomicRegion implements Locatable {
                 .map(e -> e.getKey() + "->" + e.getValue()).collect(Collectors.joining(","));
     }
 
-    /** TODO: Docs
+    /** Merges two simple annotated genomic regions.
      * Throws exception if the two regions cannot be merged.  This is usually due to being on different contigs.
      * When annotations conflict, use the separator to put separate values.
      */
@@ -138,17 +138,27 @@ final public class SimpleAnnotatedGenomicRegion implements Locatable {
          return new SimpleAnnotatedGenomicRegion(interval, annotations);
      }
 
-    /** TODO: Docs and param checks
+    /** Merge SimpleAnnotatedGenomicRegions by whether the regions overlap.  Sorting is performed as well, so input
+     * ordering is lost.
+     *
+     * When two overlapping regions are merged, annotations are merged as follows:
+     *  - The annotation appears in one region:  Resulting region will have the annotation with the value of that one region
+     *  - The annotation appears in both regions:  Resulting region will have both values separated by the {@code annotationSeparator}
+     *  parameter.
+     *
      * Only merges overlaps, not abutters.
-     * @param initialSegments
-     * @param dictionary
-     * @param annotationSeparator
+     *
+     * @param initialRegions regions to merge.  Never {@code null}
+     * @param dictionary sequence dictionary to use for sorting.
+     * @param annotationSeparator separator to use in the case of annotation conflicts.
      * @return Segments will be sorted by the sequence dictionary
      */
-    public static List<SimpleAnnotatedGenomicRegion> mergeRegions(final List<SimpleAnnotatedGenomicRegion> initialSegments,
+    public static List<SimpleAnnotatedGenomicRegion> mergeRegions(final List<SimpleAnnotatedGenomicRegion> initialRegions,
                                                                   final SAMSequenceDictionary dictionary, final String annotationSeparator) {
 
-        final List<SimpleAnnotatedGenomicRegion> segments = IntervalUtils.sortLocatablesBySequenceDictionary(initialSegments,
+        Utils.nonNull(initialRegions);
+
+        final List<SimpleAnnotatedGenomicRegion> segments = IntervalUtils.sortLocatablesBySequenceDictionary(initialRegions,
                 dictionary);
 
         final List<SimpleAnnotatedGenomicRegion> finalSegments = new ArrayList<>();
