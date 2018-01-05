@@ -1,21 +1,21 @@
-from distutils.core import setup
+from setuptools import setup
 import re
 import sys
 
+def get_gcnvkernel_version():
+    VERSIONFILE="gcnvkernel/_version.py"
+    verstrline = open(VERSIONFILE, "rt").read()
+    VSRE = r"^__version__ = ['\"]([^'\"]*)['\"]"
+    mo = re.search(VSRE, verstrline, re.M)
+    if mo:
+        return mo.group(1)
+    else:
+        raise RuntimeError("Unable to find version string in %s." % (VERSIONFILE,))
+
 assert sys.version_info >= (3, 4), "gcnvkernel requires Python 3.4.x or later"
-
-VERSIONFILE="gcnvkernel/_version.py"
-verstrline = open(VERSIONFILE, "rt").read()
-VSRE = r"^__version__ = ['\"]([^'\"]*)['\"]"
-mo = re.search(VSRE, verstrline, re.M)
-if mo:
-    verstr = mo.group(1)
-else:
-    raise RuntimeError("Unable to find version string in %s." % (VERSIONFILE,))
-
 setup(
     name='gcnvkernel',
-    version=verstr,
+    version=get_gcnvkernel_version(),
     author='Mehrtash Babadi',
     author_email='mehrtash@broadinstitute.org',
     packages=['gcnvkernel',
@@ -28,7 +28,7 @@ setup(
               'gcnvkernel.io'],
     license='LICENSE.txt',
     description='GATK gCNV computational kernel',
-    long_description=open('README.txt').read(),
+    long_description=open('gcnvkernel/README.txt').read(),
     install_requires=[
         "theano == 0.9.0",
         "pymc3 == 3.1",
