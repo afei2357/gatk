@@ -25,7 +25,7 @@ public class CompareBaseQualitiesIntegrationTest extends CommandLineProgramTest 
         ArgumentsBuilder args = new ArgumentsBuilder();
         args.add(firstBam.getCanonicalPath());
         args.add(secondBam.getCanonicalPath());
-        args.add("--throwOnDiff true");
+        args.add("--throw-on-diff true");
         args.add("--VALIDATION_STRINGENCY SILENT");
         final Object result = this.runCommandLine(args);
         Assert.assertEquals(result, 0);
